@@ -1,6 +1,6 @@
-# Resend Mailer API Server
+# Resend Mailer
 
-A Go server that implements the message-sending endpoint from the [Mail API Specification](https://github.com/mailapi/mailapi/blob/main/openapi.yaml) using the [official Resend Go SDK](https://github.com/resend/resend-go).
+A API server that implements the message-sending endpoint from the [Mail API Specification](https://github.com/mailapi/mailapi/blob/main/openapi.yaml) using the [official Resend Go SDK](https://github.com/resend/resend-go).
 
 ## Features
 
