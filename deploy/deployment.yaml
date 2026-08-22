@@ -3,9 +3,6 @@ kind: Deployment
 metadata:
   name: resend-mailer
   namespace: mailapi
-  labels:
-    app.kubernetes.io/name: resend-mailer
-    app.kubernetes.io/part-of: mailapi
 spec:
   replicas: 1
   selector:
