@@ -22,7 +22,7 @@ A Go server that implements the message-sending endpoint from the [Mail API Spec
 | `RESEND_API_KEY` | Resend API key (`re_...`) | Required unless mock mode is enabled |
 | `MOCK_MAILER` | Logs simulated delivery without sending email | `false` |
 | `ALLOW_MOCK_MAILER` | Compatibility alias for `MOCK_MAILER` | `false` |
-| `PORT` | HTTP listening port | `3000` |
+| `PORT` | HTTP listening port | `8080` |
 
 ```bash
 # Send through Resend.
@@ -38,7 +38,7 @@ go vet ./...
 ## Example request
 
 ```bash
-curl -X POST http://localhost:3000/v1/messages \
+curl -X POST http://localhost:8080/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: welcome-user/123456' \
   -d '{
@@ -59,7 +59,7 @@ A successful response has the form `{"id":"e30e66bd-8949-41e7-9154-b67f4077ff0a"
 
 ```bash
 docker build -t resend-mailer:latest .
-docker run --rm -p 3000:3000 -e RESEND_API_KEY=re_123456789 resend-mailer:latest
+docker run --rm -p 8080:8080 -e RESEND_API_KEY=re_123456789 resend-mailer:latest
 
 kubectl apply -f deploy/namespace.yaml
 kubectl -n mailapi create secret generic resend-mailer-secret \
