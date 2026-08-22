@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resend-mailer-config
+  namespace: mailapi
+data:
+  PORT: "3000"
