@@ -4,4 +4,4 @@ metadata:
   name: resend-mailer-config
   namespace: mailapi
 data:
-  PORT: "3000"
+  PORT: "8080"
