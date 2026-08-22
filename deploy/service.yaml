@@ -3,8 +3,6 @@ kind: Service
 metadata:
   name: resend-mailer
   namespace: mailapi
-  labels:
-    app.kubernetes.io/name: resend-mailer
 spec:
   type: ClusterIP
   ports:
