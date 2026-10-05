@@ -155,6 +155,7 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 	id := "msg_" + rand.Text()
 	accepted := MessageAcceptedResponse{ID: id}
 	done := make(chan *submissionResult, 1)
+	slog.Info("Submission accepted", "id", id)
 	dispatched = true
 	a.workers.Add(1)
 	go func() {
@@ -172,12 +173,14 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 			// Downstream dispatch already began. Its failure is a terminal outcome,
 			// not a local admission error that could safely be executed again.
 			result = problemResult(newAppError(500, "provider-error", "Provider error", sendErr.problem.Detail))
+			slog.Warn("Submission failed", "id", id, "error", sendErr.problem.Detail)
 		} else if response == nil || response.Id == "" {
 			result = problemResult(newAppError(500, "provider-error", "Provider error", "Provider returned no message identifier."))
+			slog.Warn("Submission failed", "id", id, "error", "provider returned no message identifier")
 		} else {
 			encoded, _ := json.Marshal(accepted)
 			result = &submissionResult{Status: 200, Body: encoded}
-			slog.Info("Submission completed", "id", id, "provider_id", response.Id)
+			slog.Info("Submission completed", "id", id, "resend_id", response.Id)
 		}
 		if err := a.idempotency.complete(scopedKey, result); err != nil {
 			slog.Error("Unable to persist terminal submission", "id", id, "error", err)
