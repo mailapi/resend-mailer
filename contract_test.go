@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	resend "github.com/resend/resend-go/v3"
 )
@@ -243,5 +245,68 @@ func TestJournalAdmissionFailureDoesNotDispatch(t *testing.T) {
 	defer mock.mu.Unlock()
 	if len(mock.sentEmails) != 1 {
 		t.Fatalf("dispatched %d times", len(mock.sentEmails))
+	}
+}
+
+func TestStablePrincipalSurvivesTokenRotation(t *testing.T) {
+	mailer := &controlledMailer{}
+	a := newApp(mailer)
+	a.token = "test-token"
+	a.principal = "wiki"
+	first := contractRequest(a, validMessage, "rotation-key", a.token, "wait=10")
+	a.token = "rotated-token"
+	replay := contractRequest(a, validMessage, "rotation-key", a.token, "wait=10")
+	if first.Code != 200 || replay.Code != 200 || replay.Header().Get("Idempotency-Replayed") != "true" || replay.Body.String() != first.Body.String() || mailer.calls != 1 {
+		t.Fatalf("first=%v replay=%v calls=%d", first, replay, mailer.calls)
+	}
+}
+
+func TestJournalReadinessAndExpiredPendingCleanup(t *testing.T) {
+	a, _ := testApp()
+	directory := t.TempDir()
+	a.idempotency.path = filepath.Join(directory, "state.json")
+	out := httptest.NewRecorder()
+	a.routes().ServeHTTP(out, httptest.NewRequest("GET", "/ready", nil))
+	if out.Code != 200 {
+		t.Fatalf("writable readiness: %v", out)
+	}
+	a.idempotency.entries["expired"] = idempotencyEntry{CreatedAt: time.Now().Add(-25 * time.Hour)}
+	a.idempotency.entries["current"] = idempotencyEntry{CreatedAt: time.Now()}
+	a.idempotency.cleanup()
+	if len(a.idempotency.entries) != 1 {
+		t.Fatalf("entries: %v", a.idempotency.entries)
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		t.Fatal(err)
+	}
+	out = httptest.NewRecorder()
+	a.routes().ServeHTTP(out, httptest.NewRequest("GET", "/ready", nil))
+	if out.Code != 503 {
+		t.Fatalf("unwritable readiness: %v", out)
+	}
+	out = httptest.NewRecorder()
+	a.routes().ServeHTTP(out, httptest.NewRequest("GET", "/health", nil))
+	if out.Code != 200 {
+		t.Fatalf("liveness: %v", out)
+	}
+}
+
+type journalFailureMailer struct{ store *idempotencyStore }
+
+func (m journalFailureMailer) Send(context.Context, *resend.SendEmailRequest, string) (*resend.SendEmailResponse, *appError) {
+	m.store.path = filepath.Join(m.store.path, "missing", "state.json")
+	return &resend.SendEmailResponse{Id: "sent-successfully"}, nil
+}
+
+func TestTerminalPersistenceFailurePreservesActualSuccess(t *testing.T) {
+	store := newIdempotencyStore()
+	store.path = filepath.Join(t.TempDir(), "state.json")
+	a := newApp(journalFailureMailer{store})
+	a.token = "test-token"
+	a.idempotency = store
+	first := contractRequest(a, validMessage, "persist-key", a.token, "wait=10")
+	replay := contractRequest(a, validMessage, "persist-key", a.token, "wait=10")
+	if first.Code != 200 || replay.Code != 200 || replay.Body.String() != first.Body.String() || replay.Header().Get("Idempotency-Replayed") != "true" {
+		t.Fatalf("first=%v replay=%v", first, replay)
 	}
 }

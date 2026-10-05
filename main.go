@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -47,6 +48,16 @@ func run() error {
 	defer store.close()
 	application := newApp(mailer)
 	application.token = token
+	application.principal = strings.TrimSpace(os.Getenv("MAILAPI_PRINCIPAL"))
+	limit := 2
+	if raw := os.Getenv("MAILAPI_CONCURRENCY_LIMIT"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 32 {
+			return errors.New("MAILAPI_CONCURRENCY_LIMIT must be between 1 and 32")
+		}
+		limit = parsed
+	}
+	application.slots = make(chan struct{}, limit)
 	application.idempotency = store
 	application.allowedFrom = make(map[string]bool)
 	for _, address := range strings.Split(os.Getenv("MAILAPI_ALLOWED_FROM"), ",") {

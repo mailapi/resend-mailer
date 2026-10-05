@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	resend "github.com/resend/resend-go/v3"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMapProviderErrorPreservesStatusAndRetryAfter(t *testing.T) {
@@ -55,3 +59,58 @@ func TestResponseCapturingTransportRetainsProviderResponse(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
+
+func TestProviderTemporaryRejectionsRetryWithSameKey(t *testing.T) {
+	for _, status := range []int{429, 503, 422} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.Header.Get("Idempotency-Key") != "same-key" {
+					t.Errorf("unexpected key: %s", r.Header.Get("Idempotency-Key"))
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if calls == 1 {
+					w.Header().Set("Retry-After", "0")
+					w.WriteHeader(status)
+					io.WriteString(w, `{"name":"temporary_error","message":"rejected"}`)
+					return
+				}
+				io.WriteString(w, `{"id":"provider-id"}`)
+			}))
+			defer server.Close()
+			client := resend.NewCustomClient(&http.Client{Transport: responseCapturingTransport{next: http.DefaultTransport}}, "test")
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+			mailer := &resendMailerClient{client: client}
+			response, err := mailer.Send(context.Background(), &resend.SendEmailRequest{From: "from@example.com", To: []string{"to@example.com"}, Subject: "Test", Text: "Hello"}, "same-key")
+			if status == 422 {
+				if calls != 1 || err == nil {
+					t.Fatalf("calls=%d error=%v", calls, err)
+				}
+				return
+			}
+			if calls != 2 || err != nil || response.Id != "provider-id" {
+				t.Fatalf("calls=%d response=%v error=%v", calls, response, err)
+			}
+		})
+	}
+}
+
+func TestProviderPacingAndCancellation(t *testing.T) {
+	client := &resendMailerClient{interval: 30 * time.Millisecond}
+	if err := client.admit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := client.admit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) < 20*time.Millisecond {
+		t.Fatal("provider requests were not paced")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.admit(ctx); err == nil {
+		t.Fatal("canceled wait admitted")
+	}
+}

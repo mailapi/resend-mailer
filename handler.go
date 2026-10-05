@@ -29,6 +29,7 @@ type app struct {
 	idempotency *idempotencyStore
 	maxBodySize int64
 	token       string
+	principal   string
 	allowedFrom map[string]bool
 	workers     sync.WaitGroup
 	slots       chan struct{}
@@ -42,6 +43,7 @@ func (a *app) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler)
 	mux.HandleFunc("GET /v1/health", healthHandler)
+	mux.HandleFunc("GET /ready", a.readinessHandler)
 	mux.HandleFunc("POST /v1/messages", a.createMessageHandler)
 	return mux
 }
@@ -138,7 +140,7 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 	// Scope both local and downstream keys to this authenticated principal.
 	scopedKey := ""
 	if key != "" {
-		scopedKey = fmt.Sprintf("%x", sha256.Sum256([]byte(a.token+"\x00"+key)))
+		scopedKey = fmt.Sprintf("%x", sha256.Sum256([]byte(a.principalID()+"\x00"+key)))
 	}
 	cached, lockErr := a.idempotency.checkAndLock(scopedKey, body)
 	if lockErr != nil {
@@ -150,7 +152,7 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 		writeResult(w, cached)
 		return
 	}
-	id := "msg_" + strings.ReplaceAll(rand.Text(), "-", "")
+	id := "msg_" + rand.Text()
 	accepted := MessageAcceptedResponse{ID: id}
 	done := make(chan *submissionResult, 1)
 	dispatched = true
@@ -175,8 +177,8 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := a.idempotency.complete(scopedKey, result); err != nil {
 			slog.Error("Unable to persist terminal submission", "id", id, "error", err)
-			result = problemResult(newAppError(500, "provider-error", "Provider error", "Unable to persist the submission outcome."))
-			_ = a.idempotency.complete(scopedKey, result)
+			// Keep the actual outcome in memory. A pending disk entry recovers
+			// conservatively as 500 if the process restarts before storage is repaired.
 		}
 		done <- result
 	}()
@@ -239,4 +241,19 @@ func waitPreference(values []string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func (a *app) principalID() string {
+	if a.principal != "" {
+		return a.principal
+	}
+	return a.token // Preserve v0.3.0 namespaces until a stable principal is configured.
+}
+
+func (a *app) readinessHandler(w http.ResponseWriter, r *http.Request) {
+	if err := a.idempotency.probe(); err != nil {
+		writeProblem(w, newAppError(503, "provider-unavailable", "Provider unavailable", "Submission journal is not writable."))
+		return
+	}
+	healthHandler(w, r)
 }
