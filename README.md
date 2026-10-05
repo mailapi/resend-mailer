@@ -1,13 +1,15 @@
 # Resend Mailer
 
-An API server that implements the message-sending endpoint from the [Mail API Specification](https://github.com/mailapi/mailapi/blob/main/openapi.yaml) using the [official Resend Go SDK](https://github.com/resend/resend-go).
+An API server that implements the message-sending endpoint from the [Mail API Specification](https://github.com/mailapi/mailapi/blob/v0.4.4/openapi.yaml) using the [official Resend Go SDK](https://github.com/resend/resend-go).
 
 ## Features
 
 - `POST /v1/messages`: converts Mail API requests and sends them through Resend
 - `GET /health` and `GET /v1/health`: health checks
 - RFC 9457 Problem Details error responses
-- 24-hour `Idempotency-Key` cache based on the SHA-256 hash of the raw request body
+- Bearer authentication and optional sender authorization
+- Default `202` acceptance; bounded `Prefer: wait=N` support (`0`–`60` seconds)
+- 24-hour principal-scoped idempotency journal, including terminal `200`/`500` replay
 - CC, BCC, Reply-To, custom headers, and Base64 attachments
 - 10 MiB request limit and graceful shutdown
 
@@ -19,6 +21,9 @@ An API server that implements the message-sending endpoint from the [Mail API Sp
 
 | Environment variable | Description | Default |
 | --- | --- | --- |
+| `MAILAPI_TOKEN` | Provider-issued bearer token accepted from clients | Required, including mock mode |
+| `MAILAPI_ALLOWED_FROM` | Comma-separated sender addresses this token may use; empty permits all | `""` |
+| `MAILAPI_STATE_FILE` | Persistent submission journal; one process per file | `data/submissions.json` (`/data/submissions.json` in Docker) |
 | `RESEND_API_KEY` | Resend API key (`re_...`) | Required unless mock mode is enabled |
 | `MOCK_MAILER` | Logs simulated delivery without sending email | `false` |
 | `ALLOW_MOCK_MAILER` | Compatibility alias for `MOCK_MAILER` | `false` |
@@ -26,10 +31,10 @@ An API server that implements the message-sending endpoint from the [Mail API Sp
 
 ```bash
 # Send through Resend.
-RESEND_API_KEY=re_123456789 go run .
+MAILAPI_TOKEN=local-test-token RESEND_API_KEY=re_123456789 go run .
 
 # Local simulated delivery.
-MOCK_MAILER=true go run .
+MAILAPI_TOKEN=local-test-token MOCK_MAILER=true go run .
 
 go test -race ./...
 go vet ./...
@@ -39,6 +44,7 @@ go vet ./...
 
 ```bash
 curl -X POST http://localhost:8080/v1/messages \
+  -H 'Authorization: Bearer local-test-token' \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: welcome-user/123456' \
   -d '{
@@ -53,17 +59,29 @@ curl -X POST http://localhost:8080/v1/messages \
   }'
 ```
 
-A successful response has the form `{"id":"e30e66bd-8949-41e7-9154-b67f4077ff0a"}`.
+A successful response has the form `{"id":"msg_..."}`. The Mail API ID is assigned before dispatch and stays unchanged between acceptance and terminal replay; the downstream Resend ID is logged separately. Acceptance is not a delivery receipt.
+
+Without `Prefer`, submission returns `202` and continues independently of the client connection. Add `Prefer: wait=10` to wait for up to ten seconds: a completed submission returns `200` (or a terminal `500`), otherwise it returns `202`. Applied waits include `Preference-Applied`. Invalid or unsupported preferences are ignored.
+
+Matching keyed retries during execution return `409`; after completion they replay the exact terminal status/body with `Idempotency-Replayed: true`. Input validation, authorization, and the two-concurrent-submission admission limit happen before reservation. Admission saturation returns `429` with `Retry-After: 1`; an unavailable journal returns `503` before execution. Failures after downstream dispatch begins become terminal `500` outcomes and are retained so retries cannot dispatch again.
+
+At least one recipient across `to`, `cc`, and `bcc`, and at least one of `text`/`html`, are required. Explicit empty `to`/`cc`/`bcc` lists, null fields, invalid header names, and structured/MIME framing headers are rejected. Unknown members inside `extensions` are ignored. Resend represents custom headers as a map, so repeated case-insensitive header names are a documented provider limitation and produce `422`.
+
+## Upgrading from v0.2.x
+
+Set `MAILAPI_TOKEN` on the server and configure the same bearer token in clients (MediaWiki: `$wgMailAPIToken`). Clients must accept `202` as well as `200`. Mount a durable journal volume and run one replica; changing the token establishes a different authenticated principal and idempotency namespace. Keep the volume across restarts. Interrupted keyed executions recover as terminal `500` outcomes, never as new submissions. Authentication and the response contract are breaking changes.
 
 ## Docker and Kubernetes
 
 ```bash
 docker build -t resend-mailer:latest .
-docker run --rm -p 8080:8080 -e RESEND_API_KEY=re_123456789 resend-mailer:latest
+docker run --rm -p 8080:8080 -v resend-mailer-data:/data \
+  -e MAILAPI_TOKEN=local-test-token -e RESEND_API_KEY=re_123456789 resend-mailer:latest
 
 kubectl apply -f deploy/namespace.yaml
 kubectl -n mailapi create secret generic resend-mailer-secret \
   --from-literal=RESEND_API_KEY=re_123456789 \
+  --from-literal=MAILAPI_TOKEN=your-private-bearer-token \
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -k deploy/
 ```

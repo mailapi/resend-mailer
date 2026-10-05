@@ -17,10 +17,10 @@ func TestMapProviderErrorPreservesStatusAndRetryAfter(t *testing.T) {
 		wantType   string
 		wantRetry  string
 	}{
-		{"idempotency conflict", providerResponseMetadata{status: 409, name: "invalid_idempotent_request", message: "key reused"}, 409, "https://api.example.com/problems/idempotency-key-reused", ""},
-		{"provider unavailable", providerResponseMetadata{status: 503, message: "maintenance", retryAfter: "30"}, 503, "https://api.example.com/problems/service-unavailable", "30"},
-		{"rate limited", providerResponseMetadata{status: 429, message: "slow down", retryAfter: "5"}, 429, "https://api.example.com/problems/rate-limit-exceeded", "5"},
-		{"authentication failure is not validation", providerResponseMetadata{status: 401, message: "invalid API key"}, 500, "https://api.example.com/problems/internal-server-error", ""},
+		{"idempotency conflict", providerResponseMetadata{status: 409, name: "invalid_idempotent_request", message: "key reused"}, 409, "https://mailapi.github.io/problems/idempotency-key-reused", ""},
+		{"provider unavailable", providerResponseMetadata{status: 503, message: "maintenance", retryAfter: "30"}, 503, "https://mailapi.github.io/problems/provider-unavailable", "30"},
+		{"rate limited", providerResponseMetadata{status: 429, message: "slow down", retryAfter: "5"}, 429, "https://mailapi.github.io/problems/rate-limit-exceeded", "5"},
+		{"authentication failure is not validation", providerResponseMetadata{status: 401, message: "invalid API key"}, 500, "https://mailapi.github.io/problems/provider-error", ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

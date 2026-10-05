@@ -5,6 +5,8 @@ metadata:
   namespace: mailapi
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: resend-mailer
@@ -13,10 +15,12 @@ spec:
       labels:
         app.kubernetes.io/name: resend-mailer
     spec:
+      terminationGracePeriodSeconds: 75
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        fsGroup: 65532
       containers:
         - name: resend-mailer
           image: ghcr.io/mailapi/resend-mailer:latest
@@ -30,6 +34,9 @@ spec:
                 name: resend-mailer-config
             - secretRef:
                 name: resend-mailer-secret
+          volumeMounts:
+            - name: submissions
+              mountPath: /data
           resources:
             requests:
               cpu: 50m
@@ -59,3 +66,7 @@ spec:
             capabilities:
               drop:
                 - ALL
+      volumes:
+        - name: submissions
+          persistentVolumeClaim:
+            claimName: resend-mailer-data

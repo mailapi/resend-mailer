@@ -1,5 +1,7 @@
 package main
 
+import "encoding/json"
+
 type EmailAddress struct {
 	Email string  `json:"email"`
 	Name  *string `json:"name,omitempty"`
@@ -17,16 +19,17 @@ type Attachment struct {
 }
 
 type OutboundMessageRequest struct {
-	From        EmailAddress   `json:"from"`
-	To          []EmailAddress `json:"to"`
-	Cc          []EmailAddress `json:"cc,omitempty"`
-	Bcc         []EmailAddress `json:"bcc,omitempty"`
-	ReplyTo     []EmailAddress `json:"replyTo,omitempty"`
-	Subject     *string        `json:"subject,omitempty"`
-	Text        *string        `json:"text,omitempty"`
-	HTML        *string        `json:"html,omitempty"`
-	Headers     []Header       `json:"headers,omitempty"`
-	Attachments []Attachment   `json:"attachments,omitempty"`
+	Extensions  map[string]json.RawMessage `json:"extensions,omitempty"`
+	From        EmailAddress               `json:"from"`
+	To          []EmailAddress             `json:"to"`
+	Cc          []EmailAddress             `json:"cc,omitempty"`
+	Bcc         []EmailAddress             `json:"bcc,omitempty"`
+	ReplyTo     []EmailAddress             `json:"replyTo,omitempty"`
+	Subject     *string                    `json:"subject,omitempty"`
+	Text        *string                    `json:"text,omitempty"`
+	HTML        *string                    `json:"html,omitempty"`
+	Headers     []Header                   `json:"headers,omitempty"`
+	Attachments []Attachment               `json:"attachments,omitempty"`
 }
 
 type MessageAcceptedResponse struct {

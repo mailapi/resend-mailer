@@ -11,12 +11,16 @@ import (
 
 func testApp() (*app, *mockMailerClient) {
 	mock := &mockMailerClient{}
-	return newApp(mock), mock
+	a := newApp(mock)
+	a.token = "test-token"
+	return a, mock
 }
 
 func request(t *testing.T, handler http.Handler, method, path, contentType, body, key string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Prefer", "wait=10")
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
@@ -55,7 +59,7 @@ func TestSendMessageAllFields(t *testing.T) {
 		t.Fatalf("code=%d body=%s", response.Code, response.Body.String())
 	}
 	var accepted MessageAcceptedResponse
-	if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil || accepted.ID != "msg_1" {
+	if err := json.Unmarshal(response.Body.Bytes(), &accepted); err != nil || !strings.HasPrefix(accepted.ID, "msg_") {
 		t.Fatalf("response=%+v err=%v", accepted, err)
 	}
 	mock.mu.Lock()
@@ -76,14 +80,14 @@ func TestSendMessageAllFields(t *testing.T) {
 	if got := string(email.Attachments[0].Content); got != "Hello attachment" {
 		t.Fatalf("attachment=%q", got)
 	}
-	if mock.sentEmails[0].IdempotencyKey != "key-1" {
+	if mock.sentEmails[0].IdempotencyKey == "key-1" || len(mock.sentEmails[0].IdempotencyKey) != 64 {
 		t.Fatalf("key=%q", mock.sentEmails[0].IdempotencyKey)
 	}
 }
 
 func TestIdempotency(t *testing.T) {
 	a, mock := testApp()
-	body := `{"from":{"email":"sender@example.com"},"to":[{"email":"to@example.com"}]}`
+	body := `{"from":{"email":"sender@example.com"},"to":[{"email":"to@example.com"}],"text":"Hello"}`
 	first := request(t, a.routes(), http.MethodPost, "/v1/messages", "application/json", body, "same-key")
 	second := request(t, a.routes(), http.MethodPost, "/v1/messages", "application/json", body, "same-key")
 	conflict := request(t, a.routes(), http.MethodPost, "/v1/messages", "application/json", strings.Replace(body, "to@example.com", "other@example.com", 1), "same-key")
@@ -109,12 +113,12 @@ func TestRequestErrors(t *testing.T) {
 		{"missing content type", "", `{}`, 415},
 		{"wrong content type", "text/plain", `{}`, 415},
 		{"malformed json", "application/json", `{bad`, 400},
-		{"unknown field", "application/json", `{"from":{"email":"a@example.com","extra":true},"to":[{"email":"b@example.com"}]}`, 400},
-		{"invalid from", "application/json", `{"from":{"email":"bad"},"to":[{"email":"b@example.com"}]}`, 422},
+		{"unknown field", "application/json", `{"from":{"email":"a@example.com","extra":true},"to":[{"email":"b@example.com"}],"text":"Hello"}`, 400},
+		{"invalid from", "application/json", `{"from":{"email":"bad"},"to":[{"email":"b@example.com"}],"text":"Hello"}`, 422},
 		{"empty to", "application/json", `{"from":{"email":"a@example.com"},"to":[]}`, 422},
 		{"bad attachment", "application/json", `{"from":{"email":"a@example.com"},"to":[{"email":"b@example.com"}],"attachments":[{"filename":"x","contentType":"text/plain","content":"!!!"}]}`, 422},
 		{"duplicate header", "application/json", `{"from":{"email":"a@example.com"},"to":[{"email":"b@example.com"}],"headers":[{"name":"X-Test","value":"one"},{"name":"x-test","value":"two"}]}`, 422},
-		{"header injection", "application/json", `{"from":{"email":"a@example.com","name":"bad\r\nBcc: x@example.com"},"to":[{"email":"b@example.com"}]}`, 422},
+		{"header injection", "application/json", `{"from":{"email":"a@example.com","name":"bad\r\nBcc: x@example.com"},"to":[{"email":"b@example.com"}],"text":"Hello"}`, 422},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -132,7 +136,7 @@ func TestRequestErrors(t *testing.T) {
 
 func TestCaseInsensitiveContentTypeAndBodyLimit(t *testing.T) {
 	a, _ := testApp()
-	body := `{"from":{"email":"a@example.com"},"to":[{"email":"b@example.com"}]}`
+	body := `{"from":{"email":"a@example.com"},"to":[{"email":"b@example.com"}],"text":"Hello"}`
 	if got := request(t, a.routes(), http.MethodPost, "/v1/messages", "Application/JSON; charset=utf-8", body, "").Code; got != 200 {
 		t.Fatalf("code=%d", got)
 	}

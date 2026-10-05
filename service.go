@@ -86,10 +86,10 @@ func (c *resendMailerClient) Send(ctx context.Context, email *resend.SendEmailRe
 	var rateLimit *resend.RateLimitError
 	if errors.As(err, &rateLimit) {
 		return nil, &appError{status: http.StatusTooManyRequests, retryAfter: rateLimit.RetryAfter, problem: Problem{
-			Type: "https://api.example.com/problems/rate-limit-exceeded", Title: "Submission rate limit exceeded", Status: http.StatusTooManyRequests, Detail: rateLimit.Message,
+			Type: "https://mailapi.github.io/problems/rate-limit-exceeded", Title: "Submission rate limit exceeded", Status: http.StatusTooManyRequests, Detail: rateLimit.Message,
 		}}
 	}
-	return nil, newAppError(http.StatusInternalServerError, "internal-server-error", "Unexpected provider error", strings.TrimPrefix(err.Error(), "[ERROR]: "))
+	return nil, newAppError(http.StatusInternalServerError, "provider-error", "Unexpected provider error", strings.TrimPrefix(err.Error(), "[ERROR]: "))
 }
 
 func mapProviderError(metadata *providerResponseMetadata, cause error) *appError {
@@ -107,18 +107,18 @@ func mapProviderError(metadata *providerResponseMetadata, cause error) *appError
 		case "concurrent_idempotent_requests":
 			return idempotencyInProgress()
 		default:
-			return newAppError(http.StatusConflict, "provider-conflict", "Provider conflict", detail)
+			return newAppError(http.StatusInternalServerError, "provider-error", "Provider error", detail)
 		}
 	case http.StatusTooManyRequests:
 		return &appError{status: http.StatusTooManyRequests, retryAfter: metadata.retryAfter, problem: Problem{
-			Type: "https://api.example.com/problems/rate-limit-exceeded", Title: "Submission rate limit exceeded", Status: http.StatusTooManyRequests, Detail: detail,
+			Type: "https://mailapi.github.io/problems/rate-limit-exceeded", Title: "Submission rate limit exceeded", Status: http.StatusTooManyRequests, Detail: detail,
 		}}
 	case http.StatusServiceUnavailable:
 		return &appError{status: http.StatusServiceUnavailable, retryAfter: metadata.retryAfter, problem: Problem{
-			Type: "https://api.example.com/problems/service-unavailable", Title: "Service Unavailable", Status: http.StatusServiceUnavailable, Detail: detail,
+			Type: "https://mailapi.github.io/problems/provider-unavailable", Title: "Service Unavailable", Status: http.StatusServiceUnavailable, Detail: detail,
 		}}
 	default:
-		return newAppError(http.StatusInternalServerError, "internal-server-error", "Unexpected provider error", detail)
+		return newAppError(http.StatusInternalServerError, "provider-error", "Unexpected provider error", detail)
 	}
 }
 
@@ -142,11 +142,14 @@ func (c *mockMailerClient) Send(_ context.Context, email *resend.SendEmailReques
 }
 
 func buildResendEmail(req *OutboundMessageRequest) (*resend.SendEmailRequest, *appError) {
+	if req.Text == nil && req.HTML == nil {
+		return nil, unprocessable("At least one of text or html is required")
+	}
 	if err := validateAddress(req.From); err != nil {
 		return nil, unprocessable(err.Error())
 	}
-	if len(req.To) == 0 {
-		return nil, unprocessable("'to' field must contain at least 1 recipient email address")
+	if len(req.To)+len(req.Cc)+len(req.Bcc) == 0 {
+		return nil, unprocessable("At least one recipient is required across to, cc, and bcc")
 	}
 	for label, addresses := range map[string][]EmailAddress{"to": req.To, "cc": req.Cc, "bcc": req.Bcc, "replyTo": req.ReplyTo} {
 		for i, address := range addresses {
@@ -172,13 +175,16 @@ func buildResendEmail(req *OutboundMessageRequest) (*resend.SendEmailRequest, *a
 	email.ReplyTo = strings.Join(formatAddresses(req.ReplyTo), ", ")
 	seenHeaders := make(map[string]struct{}, len(req.Headers))
 	for _, header := range req.Headers {
-		if strings.TrimSpace(header.Name) == "" {
+		if !validHeaderName(header.Name) {
 			return nil, unprocessable("Header name cannot be empty")
 		}
 		if strings.ContainsAny(header.Name, "\r\n") || strings.ContainsAny(header.Value, "\r\n") {
 			return nil, unprocessable(fmt.Sprintf("Header '%s' contains invalid newline characters", header.Name))
 		}
 		canonicalName := strings.ToLower(header.Name)
+		if reservedHeader(canonicalName) {
+			return nil, unprocessable("Structured and MIME framing headers are not allowed: " + header.Name)
+		}
 		if _, exists := seenHeaders[canonicalName]; exists {
 			return nil, unprocessable(fmt.Sprintf("Duplicate header '%s' is not supported by the Resend provider", header.Name))
 		}
@@ -231,4 +237,24 @@ func formatAddresses(addresses []EmailAddress) []string {
 		result[i] = formatAddress(address)
 	}
 	return result
+}
+
+func validHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, c := range name {
+		if c < 33 || c > 126 || c == ':' {
+			return false
+		}
+	}
+	return true
+}
+
+func reservedHeader(name string) bool {
+	switch name {
+	case "from", "to", "cc", "bcc", "reply-to", "subject", "content-type", "content-transfer-encoding", "mime-version":
+		return true
+	}
+	return false
 }

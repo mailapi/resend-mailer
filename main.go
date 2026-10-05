@@ -32,9 +32,32 @@ func run() error {
 		return errors.New("RESEND_API_KEY is not set; set MOCK_MAILER=true for local mock mode")
 	}
 
+	token := strings.TrimSpace(os.Getenv("MAILAPI_TOKEN"))
+	if token == "" || !visibleASCII(token) {
+		return errors.New("MAILAPI_TOKEN must be set to a non-empty visible ASCII bearer token")
+	}
+	stateFile := os.Getenv("MAILAPI_STATE_FILE")
+	if stateFile == "" {
+		stateFile = "data/submissions.json"
+	}
+	store, err := openIdempotencyStore(stateFile)
+	if err != nil {
+		return fmt.Errorf("open submission journal: %w", err)
+	}
+	defer store.close()
 	application := newApp(mailer)
+	application.token = token
+	application.idempotency = store
+	application.allowedFrom = make(map[string]bool)
+	for _, address := range strings.Split(os.Getenv("MAILAPI_ALLOWED_FROM"), ",") {
+		if address = strings.TrimSpace(address); address != "" {
+			application.allowedFrom[strings.ToLower(address)] = true
+		}
+	}
 	cleanupDone := make(chan struct{})
+	cleanupStopped := make(chan struct{})
 	go func() {
+		defer close(cleanupStopped)
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -46,7 +69,8 @@ func run() error {
 			}
 		}
 	}()
-	defer close(cleanupDone)
+	defer func() { close(cleanupDone); <-cleanupStopped }()
+	defer application.workers.Wait()
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -66,7 +90,7 @@ func run() error {
 		}
 	case <-ctx.Done():
 		slog.Info("Shutdown signal received")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("graceful shutdown: %w", err)

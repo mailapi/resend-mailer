@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,7 +13,11 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
 )
 
 // resend-go encodes attachment bytes as an integer array, so this conservative
@@ -20,10 +28,14 @@ type app struct {
 	mailer      mailerClient
 	idempotency *idempotencyStore
 	maxBodySize int64
+	token       string
+	allowedFrom map[string]bool
+	workers     sync.WaitGroup
+	slots       chan struct{}
 }
 
 func newApp(mailer mailerClient) *app {
-	return &app{mailer: mailer, idempotency: newIdempotencyStore(), maxBodySize: maxBodyLimitBytes}
+	return &app{mailer: mailer, idempotency: newIdempotencyStore(), maxBodySize: maxBodyLimitBytes, slots: make(chan struct{}, 2)}
 }
 
 func (a *app) routes() http.Handler {
@@ -40,6 +52,13 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
+	credentials := strings.Fields(r.Header.Get("Authorization"))
+	if len(r.Header.Values("Authorization")) != 1 || a.token == "" || len(credentials) != 2 || !strings.EqualFold(credentials[0], "Bearer") || subtle.ConstantTimeCompare([]byte(credentials[1]), []byte(a.token)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="mailapi"`)
+		writeProblem(w, newAppError(401, "unauthenticated", "Unauthenticated", "Missing or invalid bearer token."))
+		return
+	}
+
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || !strings.EqualFold(mediaType, "application/json") {
 		detail := "Missing Content-Type header. Expected 'application/json'"
@@ -51,7 +70,7 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key := r.Header.Get("Idempotency-Key")
-	if len(key) > 256 {
+	if len(r.Header.Values("Idempotency-Key")) > 1 || len(key) > 256 || (key != "" && !visibleASCII(key)) {
 		writeProblem(w, badRequest("Idempotency-Key must be between 1 and 256 characters"))
 		return
 	}
@@ -71,21 +90,10 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cachedID, lockErr := a.idempotency.checkAndLock(key, body)
-	if lockErr != nil {
-		writeProblem(w, lockErr)
+	if !utf8.Valid(body) {
+		writeProblem(w, badRequest("Request body must be valid UTF-8"))
 		return
 	}
-	if cachedID != "" {
-		writeJSON(w, http.StatusOK, MessageAcceptedResponse{ID: cachedID})
-		return
-	}
-	failed := true
-	defer func() {
-		if failed {
-			a.idempotency.fail(key)
-		}
-	}()
 
 	var request OutboundMessageRequest
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -99,21 +107,94 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if validationErr := validateJSONFields(body); validationErr != nil {
+		writeProblem(w, validationErr)
+		return
+	}
+	if len(a.allowedFrom) > 0 && !a.allowedFrom[strings.ToLower(request.From.Email)] {
+		writeProblem(w, newAppError(403, "forbidden", "Forbidden", "This principal may not send as the requested from address."))
+		return
+	}
 	email, buildErr := buildResendEmail(&request)
 	if buildErr != nil {
 		writeProblem(w, buildErr)
 		return
 	}
-	response, sendErr := a.mailer.Send(r.Context(), email, key)
-	if sendErr != nil {
-		writeProblem(w, sendErr)
+	// Admission happens before a key is reserved. No dispatch has begun on 429.
+	select {
+	case a.slots <- struct{}{}:
+	default:
+		admissionErr := newAppError(429, "rate-limit-exceeded", "Rate limit exceeded", "Concurrent submission limit reached.")
+		admissionErr.retryAfter = "1"
+		writeProblem(w, admissionErr)
 		return
 	}
-
-	failed = false
-	a.idempotency.complete(key, body, response.Id)
-	slog.Info("Message accepted and forwarded to Resend", "id", response.Id)
-	writeJSON(w, http.StatusOK, MessageAcceptedResponse{ID: response.Id})
+	dispatched := false
+	defer func() {
+		if !dispatched {
+			<-a.slots
+		}
+	}()
+	// Scope both local and downstream keys to this authenticated principal.
+	scopedKey := ""
+	if key != "" {
+		scopedKey = fmt.Sprintf("%x", sha256.Sum256([]byte(a.token+"\x00"+key)))
+	}
+	cached, lockErr := a.idempotency.checkAndLock(scopedKey, body)
+	if lockErr != nil {
+		writeProblem(w, lockErr)
+		return
+	}
+	if cached != nil {
+		w.Header().Set("Idempotency-Replayed", "true")
+		writeResult(w, cached)
+		return
+	}
+	id := "msg_" + strings.ReplaceAll(rand.Text(), "-", "")
+	accepted := MessageAcceptedResponse{ID: id}
+	done := make(chan *submissionResult, 1)
+	dispatched = true
+	a.workers.Add(1)
+	go func() {
+		defer a.workers.Done()
+		defer func() { <-a.slots }()
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), time.Minute)
+		defer cancel()
+		response, sendErr := a.mailer.Send(ctx, email, scopedKey)
+		var result *submissionResult
+		if sendErr != nil {
+			// Downstream dispatch already began. Its failure is a terminal outcome,
+			// not a local admission error that could safely be executed again.
+			result = problemResult(newAppError(500, "provider-error", "Provider error", sendErr.problem.Detail))
+		} else if response == nil || response.Id == "" {
+			result = problemResult(newAppError(500, "provider-error", "Provider error", "Provider returned no message identifier."))
+		} else {
+			encoded, _ := json.Marshal(accepted)
+			result = &submissionResult{Status: 200, Body: encoded}
+			slog.Info("Submission completed", "id", id, "provider_id", response.Id)
+		}
+		if err := a.idempotency.complete(scopedKey, result); err != nil {
+			slog.Error("Unable to persist terminal submission", "id", id, "error", err)
+			result = problemResult(newAppError(500, "provider-error", "Provider error", "Unable to persist the submission outcome."))
+			_ = a.idempotency.complete(scopedKey, result)
+		}
+		done <- result
+	}()
+	wait, applied := waitPreference(r.Header.Values("Prefer"))
+	if applied {
+		w.Header().Set("Preference-Applied", fmt.Sprintf("wait=%d", wait))
+		timer := time.NewTimer(time.Duration(wait) * time.Second)
+		defer timer.Stop()
+		select {
+		case result := <-done:
+			writeResult(w, result)
+			return
+		case <-timer.C:
+		case <-r.Context().Done():
+			return
+		}
+	}
+	writeJSON(w, http.StatusAccepted, accepted)
 }
 
 func ensureJSONEOF(decoder *json.Decoder) error {
@@ -131,4 +212,31 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func visibleASCII(value string) bool {
+	for _, c := range value {
+		if c < 33 || c > 126 {
+			return false
+		}
+	}
+	return true
+}
+
+// Ignore unsupported preferences. Bound accepted waits to the dispatch timeout.
+func waitPreference(values []string) (int, bool) {
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			name, raw, found := strings.Cut(strings.TrimSpace(part), "=")
+			if !found || !strings.EqualFold(strings.TrimSpace(name), "wait") {
+				continue
+			}
+			raw = strings.Trim(strings.TrimSpace(raw), `"`)
+			wait, err := strconv.Atoi(raw)
+			if err == nil && wait >= 0 && wait <= 60 {
+				return wait, true
+			}
+		}
+	}
+	return 0, false
 }
