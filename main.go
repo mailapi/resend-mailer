@@ -22,10 +22,18 @@ func main() {
 }
 
 func run() error {
+	rateLimit := 2
+	if raw := os.Getenv("RESEND_RATE_LIMIT"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 100 {
+			return errors.New("RESEND_RATE_LIMIT must be between 1 and 100 requests per second")
+		}
+		rateLimit = parsed
+	}
 	var mailer mailerClient
 	if apiKey := strings.TrimSpace(os.Getenv("RESEND_API_KEY")); apiKey != "" {
-		slog.Info("Initializing Resend client with RESEND_API_KEY")
-		mailer = newResendMailerClient(apiKey)
+		slog.Info("Initializing Resend client with RESEND_API_KEY", "rate_limit", rateLimit)
+		mailer = newResendMailerClient(apiKey, rateLimit)
 	} else if envTrue("MOCK_MAILER") || envTrue("ALLOW_MOCK_MAILER") {
 		slog.Warn("MOCK_MAILER is enabled; emails will not be sent")
 		mailer = &mockMailerClient{}

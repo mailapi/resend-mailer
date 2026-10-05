@@ -37,7 +37,8 @@ func (c *resendMailerClient) admit(ctx context.Context) error {
 	if delay < 0 {
 		delay = 0
 	}
-	c.nextSend = time.Now().Add(delay + c.interval)
+	reserved := time.Now().Add(delay + c.interval)
+	c.nextSend = reserved
 	c.rateMu.Unlock()
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -45,6 +46,12 @@ func (c *resendMailerClient) admit(ctx context.Context) error {
 	case <-timer.C:
 		return nil
 	case <-ctx.Done():
+		// Return the unused slot unless a later caller has already queued behind it.
+		c.rateMu.Lock()
+		if c.nextSend.Equal(reserved) {
+			c.nextSend = reserved.Add(-c.interval)
+		}
+		c.rateMu.Unlock()
 		return ctx.Err()
 	}
 }
@@ -89,12 +96,12 @@ func (t responseCapturingTransport) RoundTrip(request *http.Request) (*http.Resp
 	return response, nil
 }
 
-func newResendMailerClient(apiKey string) *resendMailerClient {
+func newResendMailerClient(apiKey string, requestsPerSecond int) *resendMailerClient {
 	httpClient := &http.Client{
 		Timeout:   time.Minute,
 		Transport: responseCapturingTransport{next: http.DefaultTransport},
 	}
-	return &resendMailerClient{client: resend.NewCustomClient(httpClient, apiKey), interval: 500 * time.Millisecond}
+	return &resendMailerClient{client: resend.NewCustomClient(httpClient, apiKey), interval: time.Second / time.Duration(requestsPerSecond)}
 }
 
 func (c *resendMailerClient) Send(ctx context.Context, email *resend.SendEmailRequest, key string) (*resend.SendEmailResponse, *appError) {

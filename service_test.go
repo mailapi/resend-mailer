@@ -115,6 +115,26 @@ func TestProviderPacingAndCancellation(t *testing.T) {
 	}
 }
 
+func TestCanceledPacingReturnsSlot(t *testing.T) {
+	client := &resendMailerClient{interval: 100 * time.Millisecond}
+	if err := client.admit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.admit(ctx); err == nil {
+		t.Fatal("canceled wait admitted")
+	}
+	// Without the refund, the canceled reservation would push this to ~200ms.
+	start := time.Now()
+	if err := client.admit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 170*time.Millisecond {
+		t.Fatalf("canceled reservation was not returned: waited %v", elapsed)
+	}
+}
+
 func TestProviderRetryBoundsAndGeneratedKeys(t *testing.T) {
 	tests := []struct {
 		name       string
