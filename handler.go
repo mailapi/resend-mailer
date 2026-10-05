@@ -33,10 +33,11 @@ type app struct {
 	allowedFrom map[string]bool
 	workers     sync.WaitGroup
 	slots       chan struct{}
+	queue       *admissionQueue
 }
 
 func newApp(mailer mailerClient) *app {
-	return &app{mailer: mailer, idempotency: newIdempotencyStore(), maxBodySize: maxBodyLimitBytes, slots: make(chan struct{}, 2)}
+	return &app{mailer: mailer, idempotency: newIdempotencyStore(), maxBodySize: maxBodyLimitBytes, slots: make(chan struct{}, 2), queue: newAdmissionQueue(defaultQueueLimit, defaultQueueMaxBytes)}
 }
 
 func (a *app) routes() http.Handler {
@@ -123,10 +124,9 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Admission happens before a key is reserved. No dispatch has begun on 429.
-	select {
-	case a.slots <- struct{}{}:
-	default:
-		admissionErr := newAppError(429, "rate-limit-exceeded", "Rate limit exceeded", "Concurrent submission limit reached.")
+	size := int64(len(body))
+	if !a.queue.acquire(size) {
+		admissionErr := newAppError(429, "rate-limit-exceeded", "Rate limit exceeded", "Submission queue is full.")
 		admissionErr.retryAfter = "1"
 		writeProblem(w, admissionErr)
 		return
@@ -134,7 +134,7 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 	dispatched := false
 	defer func() {
 		if !dispatched {
-			<-a.slots
+			a.queue.release(size)
 		}
 	}()
 	// Scope both local and downstream keys to this authenticated principal.
@@ -159,6 +159,10 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 	a.workers.Add(1)
 	go func() {
 		defer a.workers.Done()
+		defer a.queue.release(size)
+		// Queued submissions wait here for a dispatch slot; the dispatch
+		// deadline starts only once sending begins.
+		a.slots <- struct{}{}
 		defer func() { <-a.slots }()
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), time.Minute)
 		defer cancel()

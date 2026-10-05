@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -158,14 +159,15 @@ func TestAdmissionLimitDoesNotReserveKey(t *testing.T) {
 	c := &controlledMailer{release: make(chan struct{})}
 	a := newApp(c)
 	a.token = "test-token"
-	a.slots <- struct{}{}
-	a.slots <- struct{}{}
+	a.queue = newAdmissionQueue(1, defaultQueueMaxBytes)
+	if !a.queue.acquire(1) {
+		t.Fatal("empty queue rejected")
+	}
 	out := contractRequest(a, validMessage, "key", a.token, "")
 	if out.Code != 429 || out.Header().Get("Retry-After") != "1" {
 		t.Fatalf("admission: %v", out)
 	}
-	<-a.slots
-	<-a.slots
+	a.queue.release(1)
 	close(c.release)
 	if out = contractRequest(a, validMessage, "key", a.token, "wait=10"); out.Code != 200 {
 		t.Fatalf("reserved on 429: %v", out)
@@ -309,4 +311,55 @@ func TestTerminalPersistenceFailurePreservesActualSuccess(t *testing.T) {
 	if first.Code != 200 || replay.Code != 200 || replay.Body.String() != first.Body.String() || replay.Header().Get("Idempotency-Replayed") != "true" {
 		t.Fatalf("first=%v replay=%v", first, replay)
 	}
+}
+
+func TestSequentialSubmissionsQueueWhileWorkersSend(t *testing.T) {
+	c := &blockingMailer{release: make(chan struct{})}
+	a := newApp(c)
+	a.token = "test-token"
+	// Two dispatch slots are busy; later submissions queue instead of failing.
+	for i := 0; i < defaultQueueLimit; i++ {
+		if out := contractRequest(a, validMessage, "", a.token, ""); out.Code != 202 {
+			t.Fatalf("submission %d: %v", i, out)
+		}
+	}
+	if out := contractRequest(a, validMessage, "", a.token, ""); out.Code != 429 {
+		t.Fatalf("full queue: %v", out)
+	}
+	close(c.release)
+	a.workers.Wait()
+	if got := c.sent.Load(); got != defaultQueueLimit {
+		t.Fatalf("sent %d of %d queued submissions", got, defaultQueueLimit)
+	}
+	if out := contractRequest(a, validMessage, "", a.token, "wait=10"); out.Code != 200 {
+		t.Fatalf("drained queue: %v", out)
+	}
+}
+
+func TestQueueByteBudget(t *testing.T) {
+	q := newAdmissionQueue(10, 100)
+	if !q.acquire(150) {
+		t.Fatal("oversized request rejected from an empty queue")
+	}
+	if q.acquire(1) {
+		t.Fatal("byte budget exceeded")
+	}
+	q.release(150)
+	if !q.acquire(60) || !q.acquire(40) || q.acquire(1) {
+		t.Fatal("byte budget accounting")
+	}
+}
+
+type blockingMailer struct {
+	release chan struct{}
+	sent    atomic.Int64
+}
+
+func (m *blockingMailer) Send(ctx context.Context, _ *resend.SendEmailRequest, _ string) (*resend.SendEmailResponse, *appError) {
+	select {
+	case <-m.release:
+	case <-ctx.Done():
+	}
+	m.sent.Add(1)
+	return &resend.SendEmailResponse{Id: "provider-id"}, nil
 }

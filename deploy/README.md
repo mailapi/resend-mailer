@@ -18,3 +18,4 @@ kubectl apply -k .
 - Upgrade existing v0.2.x deployments by creating/updating the Secret with `MAILAPI_TOKEN`, provisioning the PVC, and updating clients to accept `202` before rollout.
 - The `latest` tag is pulled for each new Pod for development convenience. Pin a release tag or image digest in production.
 - The request size is limited to 10 MiB to bound attachment serialization memory usage.
+- Accepted submissions wait in a bounded in-memory queue (`MAILAPI_QUEUE_LIMIT`, `MAILAPI_QUEUE_MAX_BYTES`). Keep the queue small enough to drain within `terminationGracePeriodSeconds` at `RESEND_RATE_LIMIT`; submissions still queued when the Pod is killed recover as terminal `500` with an unknown outcome. The 32 MiB default byte budget fits within the 256 MiB memory limit.
