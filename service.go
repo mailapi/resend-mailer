@@ -148,7 +148,6 @@ func (c *resendMailerClient) Send(ctx context.Context, email *resend.SendEmailRe
 		metadata = &providerResponseMetadata{}
 	}
 
-	slog.Error("Resend API error", "error", err)
 	if ctx.Err() == nil && metadata.status != 0 {
 		return nil, mapProviderError(metadata, err)
 	}
