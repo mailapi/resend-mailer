@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -97,6 +98,11 @@ func newResendMailerClient(apiKey string) *resendMailerClient {
 }
 
 func (c *resendMailerClient) Send(ctx context.Context, email *resend.SendEmailRequest, key string) (*resend.SendEmailResponse, *appError) {
+	if key == "" {
+		// Unkeyed API calls still need one stable key for internal provider retries.
+		key = "submission_" + rand.Text()
+	}
+
 	var metadata *providerResponseMetadata
 	var response *resend.SendEmailResponse
 	var err error
@@ -116,6 +122,9 @@ func (c *resendMailerClient) Send(ctx context.Context, email *resend.SendEmailRe
 			break
 		}
 		delay, ok := providerRetryDelay(metadata.retryAfter)
+		if deadline, bounded := ctx.Deadline(); bounded && time.Until(deadline) <= delay+2*time.Second {
+			ok = false
+		}
 		if !ok {
 			break
 		}
@@ -316,7 +325,7 @@ func providerRetryDelay(value string) (time.Duration, bool) {
 	if value == "" {
 		return time.Second, true
 	}
-	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 && seconds <= 60 {
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 && seconds <= 2 {
 		return time.Duration(seconds) * time.Second, true
 	}
 	if date, err := http.ParseTime(value); err == nil {
@@ -324,7 +333,7 @@ func providerRetryDelay(value string) (time.Duration, bool) {
 		if delay < 0 {
 			delay = 0
 		}
-		return delay, delay <= time.Minute
+		return delay, delay <= 2*time.Second
 	}
 	return 0, false
 }

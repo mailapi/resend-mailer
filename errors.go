@@ -32,7 +32,9 @@ func idempotencyReused() *appError {
 }
 
 func idempotencyInProgress() *appError {
-	return newAppError(http.StatusConflict, "idempotency-key-in-progress", "Idempotent submission in progress", "Retry the request with the same key later.")
+	err := newAppError(http.StatusConflict, "idempotency-key-in-progress", "Idempotent submission in progress", "Retry the request with the same key later.")
+	err.retryAfter = "1"
+	return err
 }
 
 func writeProblem(w http.ResponseWriter, err *appError) {

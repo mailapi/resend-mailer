@@ -84,7 +84,7 @@ func TestAsyncAndTerminalReplay(t *testing.T) {
 	}
 	<-c.started
 	pending := contractRequest(a, validMessage, "key", a.token, "")
-	if pending.Code != 409 {
+	if pending.Code != 409 || pending.Header().Get("Retry-After") != "1" {
 		t.Fatalf("pending: %v", pending)
 	}
 	close(c.release)

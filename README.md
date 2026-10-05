@@ -22,7 +22,7 @@ An API server that implements the message-sending endpoint from the [Mail API Sp
 | Environment variable | Description | Default |
 | --- | --- | --- |
 | `MAILAPI_TOKEN` | Provider-issued bearer token accepted from clients | Required, including mock mode |
-| `MAILAPI_PRINCIPAL` | Stable idempotency namespace across token rotation; preserve the old token value when first enabling this for an existing journal | Defaults to `MAILAPI_TOKEN` |
+| `MAILAPI_PRINCIPAL` | Stable idempotency namespace across token rotation; use a non-secret identifier for new installations; legacy namespace adoption is described below | Defaults to `MAILAPI_TOKEN` |
 | `MAILAPI_CONCURRENCY_LIMIT` | Concurrent submissions, from 1 to 32 | `2` |
 | `MAILAPI_ALLOWED_FROM` | Comma-separated sender addresses this token may use; empty permits all | `""` |
 | `MAILAPI_STATE_FILE` | Persistent submission journal; one process per file | `data/submissions.json` (`/data/submissions.json` in Docker) |
@@ -65,13 +65,13 @@ A successful response has the form `{"id":"msg_..."}`. The Mail API ID is assign
 
 Without `Prefer`, submission returns `202` and continues independently of the client connection. Add `Prefer: wait=10` to wait for up to ten seconds: a completed submission returns `200` (or a terminal `500`), otherwise it returns `202`. Applied waits include `Preference-Applied`. Invalid or unsupported preferences are ignored.
 
-Matching keyed retries during execution return `409`; after completion they replay the exact terminal status/body with `Idempotency-Replayed: true`. Input validation, authorization, and the configurable concurrent-submission admission limit happen before reservation. Admission saturation returns `429` with `Retry-After: 1`; an unavailable journal returns `503` before execution. Resend requests are paced at two per second. Confirmed downstream 429/503 rejections are retried at most twice with the same provider key, honoring Retry-After within the one-minute dispatch deadline; ambiguous transport failures are not retried. Failures after downstream dispatch begins become terminal `500` outcomes and are retained so retries cannot dispatch again.
+Matching keyed retries during execution return `409`; after completion they replay the exact terminal status/body with `Idempotency-Replayed: true`. Input validation, authorization, and the configurable concurrent-submission admission limit happen before reservation. Admission saturation returns `429` with `Retry-After: 1`; an unavailable journal returns `503` before execution. Resend requests are paced at two per second. Confirmed downstream 429/503 rejections are retried at most twice with the same provider key, honoring Retry-After of at most two seconds and leaving at least two seconds for another request within the one-minute dispatch deadline; ambiguous transport failures are not retried. Failures after downstream dispatch begins become terminal `500` outcomes and are retained so retries cannot dispatch again.
 
 At least one recipient across `to`, `cc`, and `bcc`, and at least one of `text`/`html`, are required. Explicit empty `to`/`cc`/`bcc` lists, null fields, invalid header names, and structured/MIME framing headers are rejected. Unknown members inside `extensions` are ignored. Resend represents custom headers as a map, so repeated case-insensitive header names are a documented provider limitation and produce `422`.
 
 ## Upgrading from v0.2.x
 
-Set `MAILAPI_TOKEN` on the server and configure the same bearer token in clients (MediaWiki: `$wgMailAPIToken`). Clients must accept `202` as well as `200`. Mount a durable journal volume and run one replica; changing the token establishes a different authenticated principal and idempotency namespace. Set `MAILAPI_PRINCIPAL` to a stable identifier for future token rotation; when adopting it with existing journal entries, use the previous token value to preserve their namespace. Keep the volume across restarts. Interrupted keyed executions recover as terminal `500` outcomes, never as new submissions. Authentication and the response contract are breaking changes.
+Set `MAILAPI_TOKEN` on the server and configure the same bearer token in clients (MediaWiki: `$wgMailAPIToken`). Clients must accept `202` as well as `200`. Mount a durable journal volume and run one replica; when `MAILAPI_PRINCIPAL` is unset, changing the token establishes a different idempotency namespace. Set `MAILAPI_PRINCIPAL` to a stable identifier for future token rotation; for new installations, choose a non-secret identifier such as `wiki-production` before accepting submissions. For an existing journal using the token fallback, retaining its namespace requires the previous token value; inject that value only from a Secret, never a ConfigMap or public configuration. Keep the volume across restarts. Interrupted keyed executions recover as terminal `500` outcomes, never as new submissions. Authentication and the response contract are breaking changes.
 
 ## Docker and Kubernetes
 
@@ -91,3 +91,5 @@ kubectl apply -k deploy/
 See [deploy/README.md](deploy/README.md) for deployment setup and operational limitations.
 
 If terminal journal persistence fails, the running process preserves the actual result for replay and logs the failure. After a restart, the pending disk entry recovers as an unknown-outcome terminal 500. Readiness checks test journal-directory writes; liveness remains available.
+
+Unkeyed API submissions receive a generated provider idempotency key that is retained across internal retries. Separate unkeyed API calls remain separate submissions. In-progress keyed requests return `Retry-After: 1`. Readiness failures remove the Pod from Service routing, so clients may receive connection errors rather than an HTTP 503.

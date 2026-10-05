@@ -114,3 +114,66 @@ func TestProviderPacingAndCancellation(t *testing.T) {
 		t.Fatal("canceled wait admitted")
 	}
 }
+
+func TestProviderRetryBoundsAndGeneratedKeys(t *testing.T) {
+	tests := []struct {
+		name       string
+		retryAfter string
+		deadline   time.Duration
+		wantCalls  int
+	}{
+		{"unkeyed stable retry", "0", time.Minute, 2},
+		{"long retry after", "30", time.Minute, 1},
+		{"insufficient deadline", "0", time.Second, 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			firstKey, firstBody := "", ""
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				key := r.Header.Get("Idempotency-Key")
+				body, _ := io.ReadAll(r.Body)
+				if key == "" {
+					t.Error("provider key missing")
+				}
+				if calls == 1 {
+					firstKey, firstBody = key, string(body)
+				} else if key != firstKey || string(body) != firstBody {
+					t.Error("retry changed key or body")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if calls == 1 {
+					w.Header().Set("Retry-After", test.retryAfter)
+					w.WriteHeader(503)
+					io.WriteString(w, `{"name":"service_unavailable","message":"temporary"}`)
+					return
+				}
+				io.WriteString(w, `{"id":"provider-id"}`)
+			}))
+			defer server.Close()
+			client := resend.NewCustomClient(&http.Client{Transport: responseCapturingTransport{next: http.DefaultTransport}}, "test")
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+			ctx, cancel := context.WithTimeout(context.Background(), test.deadline)
+			defer cancel()
+			_, err := (&resendMailerClient{client: client}).Send(ctx, &resend.SendEmailRequest{From: "from@example.com", To: []string{"to@example.com"}, Text: "Hello"}, "")
+			if calls != test.wantCalls || (err == nil) != (test.wantCalls == 2) {
+				t.Fatalf("calls=%d error=%v", calls, err)
+			}
+		})
+	}
+}
+
+func TestProviderRetryAfterParsing(t *testing.T) {
+	for _, value := range []string{"30", "60", "-1", "invalid", time.Now().Add(time.Minute).UTC().Format(http.TimeFormat)} {
+		if _, ok := providerRetryDelay(value); ok {
+			t.Fatalf("accepted long/invalid delay %q", value)
+		}
+	}
+	for _, value := range []string{"0", "1", "2", time.Now().Add(time.Second).UTC().Format(http.TimeFormat)} {
+		delay, ok := providerRetryDelay(value)
+		if !ok || delay < 0 || delay > 2*time.Second {
+			t.Fatalf("delay=%v ok=%v value=%q", delay, ok, value)
+		}
+	}
+}
