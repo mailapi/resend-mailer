@@ -5,3 +5,4 @@ metadata:
   namespace: mailapi
 data:
   PORT: "8080"
+  MAILAPI_STATE_FILE: "/data/submissions.json"
