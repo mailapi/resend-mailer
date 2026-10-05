@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	resend "github.com/resend/resend-go/v3"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMapProviderErrorPreservesStatusAndRetryAfter(t *testing.T) {
@@ -55,3 +59,141 @@ func TestResponseCapturingTransportRetainsProviderResponse(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
+
+func TestProviderTemporaryRejectionsRetryWithSameKey(t *testing.T) {
+	for _, status := range []int{429, 503, 422} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.Header.Get("Idempotency-Key") != "same-key" {
+					t.Errorf("unexpected key: %s", r.Header.Get("Idempotency-Key"))
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if calls == 1 {
+					w.Header().Set("Retry-After", "0")
+					w.WriteHeader(status)
+					io.WriteString(w, `{"name":"temporary_error","message":"rejected"}`)
+					return
+				}
+				io.WriteString(w, `{"id":"provider-id"}`)
+			}))
+			defer server.Close()
+			client := resend.NewCustomClient(&http.Client{Transport: responseCapturingTransport{next: http.DefaultTransport}}, "test")
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+			mailer := &resendMailerClient{client: client}
+			response, err := mailer.Send(context.Background(), &resend.SendEmailRequest{From: "from@example.com", To: []string{"to@example.com"}, Subject: "Test", Text: "Hello"}, "same-key")
+			if status == 422 {
+				if calls != 1 || err == nil {
+					t.Fatalf("calls=%d error=%v", calls, err)
+				}
+				return
+			}
+			if calls != 2 || err != nil || response.Id != "provider-id" {
+				t.Fatalf("calls=%d response=%v error=%v", calls, response, err)
+			}
+		})
+	}
+}
+
+func TestProviderPacingAndCancellation(t *testing.T) {
+	client := &resendMailerClient{interval: 30 * time.Millisecond}
+	if err := client.admit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := client.admit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) < 20*time.Millisecond {
+		t.Fatal("provider requests were not paced")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.admit(ctx); err == nil {
+		t.Fatal("canceled wait admitted")
+	}
+}
+
+func TestCanceledPacingReturnsSlot(t *testing.T) {
+	client := &resendMailerClient{interval: 100 * time.Millisecond}
+	if err := client.admit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.admit(ctx); err == nil {
+		t.Fatal("canceled wait admitted")
+	}
+	// Without the refund, the canceled reservation would push this to ~200ms.
+	start := time.Now()
+	if err := client.admit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 170*time.Millisecond {
+		t.Fatalf("canceled reservation was not returned: waited %v", elapsed)
+	}
+}
+
+func TestProviderRetryBoundsAndGeneratedKeys(t *testing.T) {
+	tests := []struct {
+		name       string
+		retryAfter string
+		deadline   time.Duration
+		wantCalls  int
+	}{
+		{"unkeyed stable retry", "0", time.Minute, 2},
+		{"long retry after", "30", time.Minute, 1},
+		{"insufficient deadline", "0", time.Second, 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			firstKey, firstBody := "", ""
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				key := r.Header.Get("Idempotency-Key")
+				body, _ := io.ReadAll(r.Body)
+				if key == "" {
+					t.Error("provider key missing")
+				}
+				if calls == 1 {
+					firstKey, firstBody = key, string(body)
+				} else if key != firstKey || string(body) != firstBody {
+					t.Error("retry changed key or body")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if calls == 1 {
+					w.Header().Set("Retry-After", test.retryAfter)
+					w.WriteHeader(503)
+					io.WriteString(w, `{"name":"service_unavailable","message":"temporary"}`)
+					return
+				}
+				io.WriteString(w, `{"id":"provider-id"}`)
+			}))
+			defer server.Close()
+			client := resend.NewCustomClient(&http.Client{Transport: responseCapturingTransport{next: http.DefaultTransport}}, "test")
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+			ctx, cancel := context.WithTimeout(context.Background(), test.deadline)
+			defer cancel()
+			_, err := (&resendMailerClient{client: client}).Send(ctx, &resend.SendEmailRequest{From: "from@example.com", To: []string{"to@example.com"}, Text: "Hello"}, "")
+			if calls != test.wantCalls || (err == nil) != (test.wantCalls == 2) {
+				t.Fatalf("calls=%d error=%v", calls, err)
+			}
+		})
+	}
+}
+
+func TestProviderRetryAfterParsing(t *testing.T) {
+	for _, value := range []string{"30", "60", "-1", "invalid", time.Now().Add(time.Minute).UTC().Format(http.TimeFormat)} {
+		if _, ok := providerRetryDelay(value); ok {
+			t.Fatalf("accepted long/invalid delay %q", value)
+		}
+	}
+	for _, value := range []string{"0", "1", "2", time.Now().Add(time.Second).UTC().Format(http.TimeFormat)} {
+		delay, ok := providerRetryDelay(value)
+		if !ok || delay < 0 || delay > 2*time.Second {
+			t.Fatalf("delay=%v ok=%v value=%q", delay, ok, value)
+		}
+	}
+}

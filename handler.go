@@ -29,19 +29,22 @@ type app struct {
 	idempotency *idempotencyStore
 	maxBodySize int64
 	token       string
+	principal   string
 	allowedFrom map[string]bool
 	workers     sync.WaitGroup
 	slots       chan struct{}
+	queue       *admissionQueue
 }
 
 func newApp(mailer mailerClient) *app {
-	return &app{mailer: mailer, idempotency: newIdempotencyStore(), maxBodySize: maxBodyLimitBytes, slots: make(chan struct{}, 2)}
+	return &app{mailer: mailer, idempotency: newIdempotencyStore(), maxBodySize: maxBodyLimitBytes, slots: make(chan struct{}, 2), queue: newAdmissionQueue(defaultQueueLimit, defaultQueueMaxBytes)}
 }
 
 func (a *app) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler)
 	mux.HandleFunc("GET /v1/health", healthHandler)
+	mux.HandleFunc("GET /ready", a.readinessHandler)
 	mux.HandleFunc("POST /v1/messages", a.createMessageHandler)
 	return mux
 }
@@ -121,10 +124,9 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Admission happens before a key is reserved. No dispatch has begun on 429.
-	select {
-	case a.slots <- struct{}{}:
-	default:
-		admissionErr := newAppError(429, "rate-limit-exceeded", "Rate limit exceeded", "Concurrent submission limit reached.")
+	size := int64(len(body))
+	if !a.queue.acquire(size) {
+		admissionErr := newAppError(429, "rate-limit-exceeded", "Rate limit exceeded", "Submission queue is full.")
 		admissionErr.retryAfter = "1"
 		writeProblem(w, admissionErr)
 		return
@@ -132,13 +134,13 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 	dispatched := false
 	defer func() {
 		if !dispatched {
-			<-a.slots
+			a.queue.release(size)
 		}
 	}()
 	// Scope both local and downstream keys to this authenticated principal.
 	scopedKey := ""
 	if key != "" {
-		scopedKey = fmt.Sprintf("%x", sha256.Sum256([]byte(a.token+"\x00"+key)))
+		scopedKey = fmt.Sprintf("%x", sha256.Sum256([]byte(a.principalID()+"\x00"+key)))
 	}
 	cached, lockErr := a.idempotency.checkAndLock(scopedKey, body)
 	if lockErr != nil {
@@ -150,13 +152,17 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 		writeResult(w, cached)
 		return
 	}
-	id := "msg_" + strings.ReplaceAll(rand.Text(), "-", "")
+	id := "msg_" + rand.Text()
 	accepted := MessageAcceptedResponse{ID: id}
 	done := make(chan *submissionResult, 1)
 	dispatched = true
 	a.workers.Add(1)
 	go func() {
 		defer a.workers.Done()
+		defer a.queue.release(size)
+		// Queued submissions wait here for a dispatch slot; the dispatch
+		// deadline starts only once sending begins.
+		a.slots <- struct{}{}
 		defer func() { <-a.slots }()
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), time.Minute)
 		defer cancel()
@@ -175,8 +181,8 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := a.idempotency.complete(scopedKey, result); err != nil {
 			slog.Error("Unable to persist terminal submission", "id", id, "error", err)
-			result = problemResult(newAppError(500, "provider-error", "Provider error", "Unable to persist the submission outcome."))
-			_ = a.idempotency.complete(scopedKey, result)
+			// Keep the actual outcome in memory. A pending disk entry recovers
+			// conservatively as 500 if the process restarts before storage is repaired.
 		}
 		done <- result
 	}()
@@ -239,4 +245,19 @@ func waitPreference(values []string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func (a *app) principalID() string {
+	if a.principal != "" {
+		return a.principal
+	}
+	return a.token // Preserve v0.3.0 namespaces until a stable principal is configured.
+}
+
+func (a *app) readinessHandler(w http.ResponseWriter, r *http.Request) {
+	if err := a.idempotency.probe(); err != nil {
+		writeProblem(w, newAppError(503, "provider-unavailable", "Provider unavailable", "Submission journal is not writable."))
+		return
+	}
+	healthHandler(w, r)
 }

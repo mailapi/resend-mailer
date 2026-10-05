@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,10 +22,14 @@ func main() {
 }
 
 func run() error {
+	rateLimit, err := envInt("RESEND_RATE_LIMIT", 2, 1, 100)
+	if err != nil {
+		return err
+	}
 	var mailer mailerClient
 	if apiKey := strings.TrimSpace(os.Getenv("RESEND_API_KEY")); apiKey != "" {
-		slog.Info("Initializing Resend client with RESEND_API_KEY")
-		mailer = newResendMailerClient(apiKey)
+		slog.Info("Initializing Resend client with RESEND_API_KEY", "rate_limit", rateLimit)
+		mailer = newResendMailerClient(apiKey, rateLimit)
 	} else if envTrue("MOCK_MAILER") || envTrue("ALLOW_MOCK_MAILER") {
 		slog.Warn("MOCK_MAILER is enabled; emails will not be sent")
 		mailer = &mockMailerClient{}
@@ -47,6 +52,21 @@ func run() error {
 	defer store.close()
 	application := newApp(mailer)
 	application.token = token
+	application.principal = strings.TrimSpace(os.Getenv("MAILAPI_PRINCIPAL"))
+	limit, err := envInt("MAILAPI_CONCURRENCY_LIMIT", 2, 1, 32)
+	if err != nil {
+		return err
+	}
+	application.slots = make(chan struct{}, limit)
+	queueLimit, err := envInt("MAILAPI_QUEUE_LIMIT", defaultQueueLimit, 1, 1000)
+	if err != nil {
+		return err
+	}
+	queueMaxBytes, err := envInt("MAILAPI_QUEUE_MAX_BYTES", defaultQueueMaxBytes, 1, 1<<30)
+	if err != nil {
+		return err
+	}
+	application.queue = newAdmissionQueue(queueLimit, int64(queueMaxBytes))
 	application.idempotency = store
 	application.allowedFrom = make(map[string]bool)
 	for _, address := range strings.Split(os.Getenv("MAILAPI_ALLOWED_FROM"), ",") {
@@ -106,4 +126,16 @@ func run() error {
 func envTrue(name string) bool {
 	value := os.Getenv(name)
 	return value == "1" || strings.EqualFold(value, "true")
+}
+
+func envInt(name string, fallback, min, max int) (int, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < min || value > max {
+		return 0, fmt.Errorf("%s must be between %d and %d", name, min, max)
+	}
+	return value, nil
 }

@@ -6,3 +6,5 @@ metadata:
 data:
   PORT: "8080"
   MAILAPI_STATE_FILE: "/data/submissions.json"
+  # Stable, non-secret idempotency namespace; keep it unchanged across token rotation.
+  MAILAPI_PRINCIPAL: "wiki-production"

@@ -169,9 +169,25 @@ func (s *idempotencyStore) cleanup() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for key, entry := range s.entries {
-		if entry.CreatedAt.Before(cutoff) && entry.Result != nil {
+		if entry.CreatedAt.Before(cutoff) {
 			delete(s.entries, key)
 		}
 	}
 	_ = s.persist()
+}
+
+func (s *idempotencyStore) probe() error {
+	if s.path == "" {
+		return nil
+	}
+	file, err := os.CreateTemp(filepath.Dir(s.path), ".readiness-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+	if _, err := file.Write([]byte("ready")); err != nil {
+		return err
+	}
+	return file.Sync()
 }

@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	resend "github.com/resend/resend-go/v3"
 )
@@ -82,7 +85,7 @@ func TestAsyncAndTerminalReplay(t *testing.T) {
 	}
 	<-c.started
 	pending := contractRequest(a, validMessage, "key", a.token, "")
-	if pending.Code != 409 {
+	if pending.Code != 409 || pending.Header().Get("Retry-After") != "1" {
 		t.Fatalf("pending: %v", pending)
 	}
 	close(c.release)
@@ -156,14 +159,15 @@ func TestAdmissionLimitDoesNotReserveKey(t *testing.T) {
 	c := &controlledMailer{release: make(chan struct{})}
 	a := newApp(c)
 	a.token = "test-token"
-	a.slots <- struct{}{}
-	a.slots <- struct{}{}
+	a.queue = newAdmissionQueue(1, defaultQueueMaxBytes)
+	if !a.queue.acquire(1) {
+		t.Fatal("empty queue rejected")
+	}
 	out := contractRequest(a, validMessage, "key", a.token, "")
 	if out.Code != 429 || out.Header().Get("Retry-After") != "1" {
 		t.Fatalf("admission: %v", out)
 	}
-	<-a.slots
-	<-a.slots
+	a.queue.release(1)
 	close(c.release)
 	if out = contractRequest(a, validMessage, "key", a.token, "wait=10"); out.Code != 200 {
 		t.Fatalf("reserved on 429: %v", out)
@@ -244,4 +248,118 @@ func TestJournalAdmissionFailureDoesNotDispatch(t *testing.T) {
 	if len(mock.sentEmails) != 1 {
 		t.Fatalf("dispatched %d times", len(mock.sentEmails))
 	}
+}
+
+func TestStablePrincipalSurvivesTokenRotation(t *testing.T) {
+	mailer := &controlledMailer{}
+	a := newApp(mailer)
+	a.token = "test-token"
+	a.principal = "wiki"
+	first := contractRequest(a, validMessage, "rotation-key", a.token, "wait=10")
+	a.token = "rotated-token"
+	replay := contractRequest(a, validMessage, "rotation-key", a.token, "wait=10")
+	if first.Code != 200 || replay.Code != 200 || replay.Header().Get("Idempotency-Replayed") != "true" || replay.Body.String() != first.Body.String() || mailer.calls != 1 {
+		t.Fatalf("first=%v replay=%v calls=%d", first, replay, mailer.calls)
+	}
+}
+
+func TestJournalReadinessAndExpiredPendingCleanup(t *testing.T) {
+	a, _ := testApp()
+	directory := t.TempDir()
+	a.idempotency.path = filepath.Join(directory, "state.json")
+	out := httptest.NewRecorder()
+	a.routes().ServeHTTP(out, httptest.NewRequest("GET", "/ready", nil))
+	if out.Code != 200 {
+		t.Fatalf("writable readiness: %v", out)
+	}
+	a.idempotency.entries["expired"] = idempotencyEntry{CreatedAt: time.Now().Add(-25 * time.Hour)}
+	a.idempotency.entries["current"] = idempotencyEntry{CreatedAt: time.Now()}
+	a.idempotency.cleanup()
+	if len(a.idempotency.entries) != 1 {
+		t.Fatalf("entries: %v", a.idempotency.entries)
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		t.Fatal(err)
+	}
+	out = httptest.NewRecorder()
+	a.routes().ServeHTTP(out, httptest.NewRequest("GET", "/ready", nil))
+	if out.Code != 503 {
+		t.Fatalf("unwritable readiness: %v", out)
+	}
+	out = httptest.NewRecorder()
+	a.routes().ServeHTTP(out, httptest.NewRequest("GET", "/health", nil))
+	if out.Code != 200 {
+		t.Fatalf("liveness: %v", out)
+	}
+}
+
+type journalFailureMailer struct{ store *idempotencyStore }
+
+func (m journalFailureMailer) Send(context.Context, *resend.SendEmailRequest, string) (*resend.SendEmailResponse, *appError) {
+	m.store.path = filepath.Join(m.store.path, "missing", "state.json")
+	return &resend.SendEmailResponse{Id: "sent-successfully"}, nil
+}
+
+func TestTerminalPersistenceFailurePreservesActualSuccess(t *testing.T) {
+	store := newIdempotencyStore()
+	store.path = filepath.Join(t.TempDir(), "state.json")
+	a := newApp(journalFailureMailer{store})
+	a.token = "test-token"
+	a.idempotency = store
+	first := contractRequest(a, validMessage, "persist-key", a.token, "wait=10")
+	replay := contractRequest(a, validMessage, "persist-key", a.token, "wait=10")
+	if first.Code != 200 || replay.Code != 200 || replay.Body.String() != first.Body.String() || replay.Header().Get("Idempotency-Replayed") != "true" {
+		t.Fatalf("first=%v replay=%v", first, replay)
+	}
+}
+
+func TestSequentialSubmissionsQueueWhileWorkersSend(t *testing.T) {
+	c := &blockingMailer{release: make(chan struct{})}
+	a := newApp(c)
+	a.token = "test-token"
+	// Two dispatch slots are busy; later submissions queue instead of failing.
+	for i := 0; i < defaultQueueLimit; i++ {
+		if out := contractRequest(a, validMessage, "", a.token, ""); out.Code != 202 {
+			t.Fatalf("submission %d: %v", i, out)
+		}
+	}
+	if out := contractRequest(a, validMessage, "", a.token, ""); out.Code != 429 {
+		t.Fatalf("full queue: %v", out)
+	}
+	close(c.release)
+	a.workers.Wait()
+	if got := c.sent.Load(); got != defaultQueueLimit {
+		t.Fatalf("sent %d of %d queued submissions", got, defaultQueueLimit)
+	}
+	if out := contractRequest(a, validMessage, "", a.token, "wait=10"); out.Code != 200 {
+		t.Fatalf("drained queue: %v", out)
+	}
+}
+
+func TestQueueByteBudget(t *testing.T) {
+	q := newAdmissionQueue(10, 100)
+	if !q.acquire(150) {
+		t.Fatal("oversized request rejected from an empty queue")
+	}
+	if q.acquire(1) {
+		t.Fatal("byte budget exceeded")
+	}
+	q.release(150)
+	if !q.acquire(60) || !q.acquire(40) || q.acquire(1) {
+		t.Fatal("byte budget accounting")
+	}
+}
+
+type blockingMailer struct {
+	release chan struct{}
+	sent    atomic.Int64
+}
+
+func (m *blockingMailer) Send(ctx context.Context, _ *resend.SendEmailRequest, _ string) (*resend.SendEmailResponse, *appError) {
+	select {
+	case <-m.release:
+	case <-ctx.Done():
+	}
+	m.sent.Add(1)
+	return &resend.SendEmailResponse{Id: "provider-id"}, nil
 }

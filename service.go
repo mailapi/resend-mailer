@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/mail"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +24,37 @@ type mailerClient interface {
 	Send(context.Context, *resend.SendEmailRequest, string) (*resend.SendEmailResponse, *appError)
 }
 
-type resendMailerClient struct{ client *resend.Client }
+type resendMailerClient struct {
+	client   *resend.Client
+	rateMu   sync.Mutex
+	nextSend time.Time
+	interval time.Duration
+}
+
+func (c *resendMailerClient) admit(ctx context.Context) error {
+	c.rateMu.Lock()
+	delay := time.Until(c.nextSend)
+	if delay < 0 {
+		delay = 0
+	}
+	reserved := time.Now().Add(delay + c.interval)
+	c.nextSend = reserved
+	c.rateMu.Unlock()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		// Return the unused slot unless a later caller has already queued behind it.
+		c.rateMu.Lock()
+		if c.nextSend.Equal(reserved) {
+			c.nextSend = reserved.Add(-c.interval)
+		}
+		c.rateMu.Unlock()
+		return ctx.Err()
+	}
+}
 
 type providerResponseMetadata struct {
 	status     int
@@ -64,23 +96,60 @@ func (t responseCapturingTransport) RoundTrip(request *http.Request) (*http.Resp
 	return response, nil
 }
 
-func newResendMailerClient(apiKey string) *resendMailerClient {
+func newResendMailerClient(apiKey string, requestsPerSecond int) *resendMailerClient {
 	httpClient := &http.Client{
 		Timeout:   time.Minute,
 		Transport: responseCapturingTransport{next: http.DefaultTransport},
 	}
-	return &resendMailerClient{client: resend.NewCustomClient(httpClient, apiKey)}
+	return &resendMailerClient{client: resend.NewCustomClient(httpClient, apiKey), interval: time.Second / time.Duration(requestsPerSecond)}
 }
 
 func (c *resendMailerClient) Send(ctx context.Context, email *resend.SendEmailRequest, key string) (*resend.SendEmailResponse, *appError) {
-	metadata := &providerResponseMetadata{}
-	ctx = context.WithValue(ctx, providerResponseMetadataContextKey{}, metadata)
-	response, err := c.client.Emails.SendWithOptions(ctx, email, &resend.SendEmailOptions{IdempotencyKey: key})
-	if err == nil {
-		return response, nil
+	if key == "" {
+		// Unkeyed API calls still need one stable key for internal provider retries.
+		key = "submission_" + rand.Text()
 	}
+
+	var metadata *providerResponseMetadata
+	var response *resend.SendEmailResponse
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = c.admit(ctx); err != nil {
+			break
+		}
+		metadata = &providerResponseMetadata{}
+		requestCtx := context.WithValue(ctx, providerResponseMetadataContextKey{}, metadata)
+		response, err = c.client.Emails.SendWithOptions(requestCtx, email, &resend.SendEmailOptions{IdempotencyKey: key})
+		if err == nil {
+			return response, nil
+		}
+		// Retry only confirmed temporary rejections, never an ambiguous transport
+		// failure. Keep the identical downstream idempotency key on every attempt.
+		if attempt == 2 || (metadata.status != 429 && metadata.status != 503) {
+			break
+		}
+		delay, ok := providerRetryDelay(metadata.retryAfter)
+		if deadline, bounded := ctx.Deadline(); bounded && time.Until(deadline) <= delay+2*time.Second {
+			ok = false
+		}
+		if !ok {
+			break
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			err = ctx.Err()
+			attempt = 2
+		}
+	}
+	if metadata == nil {
+		metadata = &providerResponseMetadata{}
+	}
+
 	slog.Error("Resend API error", "error", err)
-	if metadata.status != 0 {
+	if ctx.Err() == nil && metadata.status != 0 {
 		return nil, mapProviderError(metadata, err)
 	}
 	var rateLimit *resend.RateLimitError
@@ -257,4 +326,21 @@ func reservedHeader(name string) bool {
 		return true
 	}
 	return false
+}
+
+func providerRetryDelay(value string) (time.Duration, bool) {
+	if value == "" {
+		return time.Second, true
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 && seconds <= 2 {
+		return time.Duration(seconds) * time.Second, true
+	}
+	if date, err := http.ParseTime(value); err == nil {
+		delay := time.Until(date)
+		if delay < 0 {
+			delay = 0
+		}
+		return delay, delay <= 2*time.Second
+	}
+	return 0, false
 }
