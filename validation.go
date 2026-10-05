@@ -32,6 +32,8 @@ func validateJSONFields(body []byte) *appError {
 					return err
 				}
 			}
+		case "text", "html", "subject", "extensions":
+			// Types are checked by the typed JSON decoder.
 		case "headers", "attachments":
 			var entries []json.RawMessage
 			_ = json.Unmarshal(value, &entries)
@@ -44,6 +46,8 @@ func validateJSONFields(body []byte) *appError {
 					return err
 				}
 			}
+		default:
+			return badRequest("Unknown message field: " + name)
 		}
 	}
 	return nil
@@ -59,7 +63,17 @@ func requiredMembers(value json.RawMessage, required ...string) *appError {
 			return unprocessable(name + " is required")
 		}
 	}
+	allowed := map[string]bool{}
+	for _, name := range required {
+		allowed[name] = true
+	}
+	if required[0] == "email" {
+		allowed["name"] = true
+	}
 	for name, member := range members {
+		if !allowed[name] {
+			return badRequest("Unknown nested message field: " + name)
+		}
 		if string(member) == "null" {
 			return unprocessable(name + " must not be null")
 		}

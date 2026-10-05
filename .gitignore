@@ -1,3 +1,4 @@
 /target
 /resend-mailer
 /deploy/secret.yaml
+/data/

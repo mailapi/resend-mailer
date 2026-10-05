@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // resend-go encodes attachment bytes as an integer array, so this conservative
@@ -52,7 +53,7 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 
 func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 	credentials := strings.Fields(r.Header.Get("Authorization"))
-	if a.token == "" || len(credentials) != 2 || !strings.EqualFold(credentials[0], "Bearer") || subtle.ConstantTimeCompare([]byte(credentials[1]), []byte(a.token)) != 1 {
+	if len(r.Header.Values("Authorization")) != 1 || a.token == "" || len(credentials) != 2 || !strings.EqualFold(credentials[0], "Bearer") || subtle.ConstantTimeCompare([]byte(credentials[1]), []byte(a.token)) != 1 {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="mailapi"`)
 		writeProblem(w, newAppError(401, "unauthenticated", "Unauthenticated", "Missing or invalid bearer token."))
 		return
@@ -69,7 +70,7 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key := r.Header.Get("Idempotency-Key")
-	if len(key) > 256 || (key != "" && !visibleASCII(key)) {
+	if len(r.Header.Values("Idempotency-Key")) > 1 || len(key) > 256 || (key != "" && !visibleASCII(key)) {
 		writeProblem(w, badRequest("Idempotency-Key must be between 1 and 256 characters"))
 		return
 	}
@@ -86,6 +87,11 @@ func (a *app) createMessageHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			writeProblem(w, badRequest(readErr.Error()))
 		}
+		return
+	}
+
+	if !utf8.Valid(body) {
+		writeProblem(w, badRequest("Request body must be valid UTF-8"))
 		return
 	}
 

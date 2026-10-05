@@ -204,3 +204,44 @@ func TestJournalRestartAndExclusiveWriter(t *testing.T) {
 		t.Fatalf("interrupted submission reexecuted: %v %v", interrupted, problem)
 	}
 }
+
+func TestPrincipalScopeAndStrictRequestSyntax(t *testing.T) {
+	a, mock := testApp()
+	first := contractRequest(a, validMessage, "key", a.token, "wait=10")
+	a.token = "another-token"
+	second := contractRequest(a, validMessage, "key", a.token, "wait=10")
+	if first.Code != 200 || second.Code != 200 || first.Body.String() == second.Body.String() {
+		t.Fatalf("principal scope: %v %v", first, second)
+	}
+	mock.mu.Lock()
+	if len(mock.sentEmails) != 2 || mock.sentEmails[0].IdempotencyKey == mock.sentEmails[1].IdempotencyKey {
+		t.Fatal("downstream key namespace collided")
+	}
+	mock.mu.Unlock()
+	for _, body := range []string{
+		strings.Replace(validMessage, `"text":"Hello"`, `"text":"Hello","TEXT":"other"`, 1),
+		strings.Replace(validMessage, `"email":"sender@example.com"`, `"email":"sender@example.com","Email":"other@example.com"`, 1),
+		strings.Replace(validMessage, "Hello", string([]byte{0xff}), 1),
+	} {
+		if out := contractRequest(a, body, "fresh-key", a.token, ""); out.Code != 400 {
+			t.Fatalf("invalid syntax: %v", out)
+		}
+	}
+}
+
+func TestJournalAdmissionFailureDoesNotDispatch(t *testing.T) {
+	a, mock := testApp()
+	a.idempotency.path = filepath.Join(t.TempDir(), "missing", "journal.json")
+	if out := contractRequest(a, validMessage, "key", a.token, ""); out.Code != 503 {
+		t.Fatalf("unavailable journal: %v", out)
+	}
+	a.idempotency.path = ""
+	if out := contractRequest(a, validMessage, "key", a.token, "wait=10"); out.Code != 200 {
+		t.Fatalf("reserved failed admission: %v", out)
+	}
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if len(mock.sentEmails) != 1 {
+		t.Fatalf("dispatched %d times", len(mock.sentEmails))
+	}
+}

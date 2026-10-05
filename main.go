@@ -55,7 +55,9 @@ func run() error {
 		}
 	}
 	cleanupDone := make(chan struct{})
+	cleanupStopped := make(chan struct{})
 	go func() {
+		defer close(cleanupStopped)
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -67,7 +69,7 @@ func run() error {
 			}
 		}
 	}()
-	defer close(cleanupDone)
+	defer func() { close(cleanupDone); <-cleanupStopped }()
 	defer application.workers.Wait()
 
 	port := os.Getenv("PORT")
